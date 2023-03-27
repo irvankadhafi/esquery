@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/jgroeneveld/trial/assert"
+	"github.com/stretchr/testify/assert"
 )
 
 type mapTest struct {
