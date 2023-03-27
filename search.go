@@ -2,12 +2,15 @@ package esquery
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/elastic/go-elasticsearch/v8"
+	"io/ioutil"
+	"net/http"
 	"time"
 
-	"github.com/elastic/go-elasticsearch/v7"
-	"github.com/elastic/go-elasticsearch/v7/esapi"
+	"github.com/elastic/go-elasticsearch/v8/esapi"
 )
 
 // SearchRequest represents a request to ElasticSearch's Search API, described
@@ -15,6 +18,9 @@ import (
 // Not all features of the search API are currently supported, but a request can
 // currently include a query, aggregations, and more.
 type SearchRequest struct {
+	client *elasticsearch.Client
+	index  []string
+
 	aggs        []Aggregation
 	explain     *bool
 	from        *uint64
@@ -26,12 +32,144 @@ type SearchRequest struct {
 	sort        Sort
 	source      Source
 	timeout     *time.Duration
+}
 
+// SearchResult is the result of a search in Elasticsearch.
+type SearchResult struct {
+	Header          http.Header                `json:"-"`
+	TookInMillis    int64                      `json:"took,omitempty"`             // search time in milliseconds
+	TerminatedEarly bool                       `json:"terminated_early,omitempty"` // request terminated early
+	NumReducePhases int                        `json:"num_reduce_phases,omitempty"`
+	Clusters        *SearchResultCluster       `json:"_clusters,omitempty"`    // 6.1.0+
+	ScrollId        string                     `json:"_scroll_id,omitempty"`   // only used with Scroll and Scan operations
+	Hits            *SearchHits                `json:"hits,omitempty"`         // the actual search hits
+	Suggest         SearchSuggest              `json:"suggest,omitempty"`      // results from suggesters
+	Aggregations    map[string]json.RawMessage `json:"aggregations,omitempty"` // results from aggregations
+	TimedOut        bool                       `json:"timed_out,omitempty"`    // true if the search timed out
+	Error           *ErrorDetails              `json:"error,omitempty"`        // only used in MultiGet
+	Status          int                        `json:"status,omitempty"`       // used in MultiSearch
+	PitId           string                     `json:"pit_id,omitempty"`       // Point In Time ID
+}
+
+// SearchHits specifies the list of search hits.
+type SearchHits struct {
+	TotalHits *TotalHits   `json:"total,omitempty"`     // total number of hits found
+	MaxScore  *float64     `json:"max_score,omitempty"` // maximum score of all hits
+	Hits      []*SearchHit `json:"hits,omitempty"`      // the actual hits returned
+}
+
+// TotalHits specifies total number of hits and its relation
+type TotalHits struct {
+	Value    int64  `json:"value"`    // value of the total hit count
+	Relation string `json:"relation"` // how the value should be interpreted: accurate ("eq") or a lower bound ("gte")
+}
+
+// SearchHit is a single hit.
+type SearchHit struct {
+	Score          *float64        `json:"_score,omitempty"`   // computed score
+	Index          string          `json:"_index,omitempty"`   // index name
+	Type           string          `json:"_type,omitempty"`    // type meta field
+	Id             string          `json:"_id,omitempty"`      // external or internal
+	Uid            string          `json:"_uid,omitempty"`     // uid meta field (see MapperService.java for all meta fields)
+	Routing        string          `json:"_routing,omitempty"` // routing meta field
+	Parent         string          `json:"_parent,omitempty"`  // parent meta field
+	Version        *int64          `json:"_version,omitempty"` // version number, when Version is set to true in SearchService
+	SeqNo          *int64          `json:"_seq_no"`
+	PrimaryTerm    *int64          `json:"_primary_term"`
+	Sort           []interface{}   `json:"sort,omitempty"`            // sort information
+	Source         json.RawMessage `json:"_source,omitempty"`         // stored document source
+	MatchedQueries []string        `json:"matched_queries,omitempty"` // matched queries
+	Shard          string          `json:"_shard,omitempty"`          // used e.g. in Search Explain
+	Node           string          `json:"_node,omitempty"`           // used e.g. in Search Explain
+
+	// HighlightFields
+	// SortValues
+	// MatchedFilters
+}
+
+// SearchResultCluster holds information about a search response
+// from a cluster.
+type SearchResultCluster struct {
+	Successful int `json:"successful,omitempty"`
+	Total      int `json:"total,omitempty"`
+	Skipped    int `json:"skipped,omitempty"`
+}
+
+// Suggest
+
+// SearchSuggest is a map of suggestions.
+// See https://www.elastic.co/guide/en/elasticsearch/reference/7.0/search-suggesters.html.
+type SearchSuggest map[string][]SearchSuggestion
+
+// SearchSuggestion is a single search suggestion.
+// See https://www.elastic.co/guide/en/elasticsearch/reference/7.0/search-suggesters.html.
+type SearchSuggestion struct {
+	Text    string                   `json:"text"`
+	Offset  int                      `json:"offset"`
+	Length  int                      `json:"length"`
+	Options []SearchSuggestionOption `json:"options"`
+}
+
+// SearchSuggestionOption is an option of a SearchSuggestion.
+// See https://www.elastic.co/guide/en/elasticsearch/reference/7.0/search-suggesters.html.
+type SearchSuggestionOption struct {
+	Text            string              `json:"text"`
+	Index           string              `json:"_index"`
+	Type            string              `json:"_type"`
+	Id              string              `json:"_id"`
+	Score           float64             `json:"score"`  // term and phrase suggesters uses "score" as of 6.2.4
+	ScoreUnderscore float64             `json:"_score"` // completion and context suggesters uses "_score" as of 6.2.4
+	Highlighted     string              `json:"highlighted"`
+	CollateMatch    bool                `json:"collate_match"`
+	Freq            int                 `json:"freq"` // from TermSuggestion.Option in Java API
+	Source          json.RawMessage     `json:"_source"`
+	Contexts        map[string][]string `json:"contexts,omitempty"`
+}
+
+// ErrorDetails encapsulate error details from Elasticsearch.
+// It is used in e.g. elastic.Error and elastic.BulkResponseItem.
+type ErrorDetails struct {
+	Type         string                   `json:"type"`
+	Reason       string                   `json:"reason"`
+	ResourceType string                   `json:"resource.type,omitempty"`
+	ResourceId   string                   `json:"resource.id,omitempty"`
+	Index        string                   `json:"index,omitempty"`
+	Phase        string                   `json:"phase,omitempty"`
+	Grouped      bool                     `json:"grouped,omitempty"`
+	CausedBy     map[string]interface{}   `json:"caused_by,omitempty"`
+	RootCause    []*ErrorDetails          `json:"root_cause,omitempty"`
+	Suppressed   []*ErrorDetails          `json:"suppressed,omitempty"`
+	FailedShards []map[string]interface{} `json:"failed_shards,omitempty"`
+	Header       map[string]interface{}   `json:"header,omitempty"`
+
+	// ScriptException adds the information in the following block.
+
+	ScriptStack []string             `json:"script_stack,omitempty"` // from ScriptException
+	Script      string               `json:"script,omitempty"`       // from ScriptException
+	Lang        string               `json:"lang,omitempty"`         // from ScriptException
+	Position    *ScriptErrorPosition `json:"position,omitempty"`     // from ScriptException (7.7+)
+}
+
+// ScriptErrorPosition specifies the position of the error
+// in a script. It is used in ErrorDetails for scripting errors.
+type ScriptErrorPosition struct {
+	Offset int `json:"offset"`
+	Start  int `json:"start"`
+	End    int `json:"end"`
 }
 
 // Search creates a new SearchRequest object, to be filled via method chaining.
 func Search() *SearchRequest {
 	return &SearchRequest{}
+}
+
+func (req *SearchRequest) SetClient(es *elasticsearch.Client) {
+	req.client = es
+}
+
+func (req *SearchRequest) Index(v ...string) *SearchRequest {
+	req.index = v
+	return req
 }
 
 // Query sets a query for the request.
@@ -66,7 +204,14 @@ func (req *SearchRequest) Size(size uint64) *SearchRequest {
 }
 
 // Sort sets how the results should be sorted.
-func (req *SearchRequest) Sort(name string, order Order) *SearchRequest {
+func (req *SearchRequest) Sort(sorter Sort) *SearchRequest {
+	req.sort = sorter
+
+	return req
+}
+
+// SortByName sets how the results should be sorted.
+func (req *SearchRequest) SortByName(name string, order Order) *SearchRequest {
 	req.sort = append(req.sort, map[string]interface{}{
 		name: map[string]interface{}{
 			"order": order,
@@ -113,8 +258,6 @@ func (req *SearchRequest) Highlight(highlight Mappable) *SearchRequest {
 	return req
 }
 
-
-
 // Map implements the Mappable interface. It converts the request to into a
 // nested map[string]interface{}, as expected by the go-elasticsearch library.
 func (req *SearchRequest) Map() map[string]interface{} {
@@ -155,7 +298,6 @@ func (req *SearchRequest) Map() map[string]interface{} {
 		m["search_after"] = req.searchAfter
 	}
 
-
 	source := req.source.Map()
 	if len(source) > 0 {
 		m["_source"] = source
@@ -178,6 +320,59 @@ func (req *SearchRequest) Run(
 	o ...func(*esapi.SearchRequest),
 ) (res *esapi.Response, err error) {
 	return req.RunSearch(api.Search, o...)
+}
+
+func (req *SearchRequest) Do(ctx context.Context) (res *SearchResult, err error) {
+	var option []func(*esapi.SearchRequest)
+
+	option = append(option, req.client.Search.WithContext(ctx))
+	option = append(option, req.client.Search.WithIndex(req.index...))
+
+	result, err := req.RunSearch(req.client.Search, option...)
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := ioutil.ReadAll(result.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	err = json.Unmarshal([]byte(body), &res)
+	if err != nil {
+		return nil, err
+	}
+
+	return res, nil
+}
+
+//func (req *SearchRequest) Do(
+//	api *elasticsearch.Client,
+//	o ...func(*esapi.SearchRequest),
+//) (res *SearchResult, err error) {
+//	result, err := req.RunSearch(api.Search, o...)
+//	if err != nil {
+//		return nil, err
+//	}
+//
+//	body, err := ioutil.ReadAll(result.Body)
+//	if err != nil {
+//		return nil, err
+//	}
+//
+//	err = json.Unmarshal([]byte(body), &res)
+//	if err != nil {
+//		return nil, err
+//	}
+//
+//	return res, nil
+//}
+
+func (r *SearchResult) TotalHits() int64 {
+	if r != nil && r.Hits != nil && r.Hits.TotalHits != nil {
+		return r.Hits.TotalHits.Value
+	}
+	return 0
 }
 
 // RunSearch is the same as the Run method, except that it accepts a value of
